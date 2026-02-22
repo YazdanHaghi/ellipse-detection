@@ -6,366 +6,543 @@ import json
 import os
 from collections import defaultdict
 
-# --- CONFIGURATION ---
+# -------------------------
+# CONFIG
+# -------------------------
 IMAGE_FOLDER = "ellipses"
 ANNOTATIONS_FILE = "annotations.json"
 WORLD_SPACE_SIZE = 100
 
-# --- OPTIMIZED RHT PARAMETERS ---
-RHT_EPOCHS = 3000          # More tries = better chance to hit
-ACCUMULATOR_BIN_SIZE = 2   # Groups similar ellipses (2px tolerance)
-MIN_VOTES = 3              # Accepts weaker peaks
-INLIER_THRESHOLD = 2.5     # Pixel matching looseness
+# Evaluation (keep your strict setting if you want)
+MATCH_THRESH_DIST = 5.0
+MATCH_THRESH_AXIS = 0.5
 
-# --- MATCHING THRESHOLDS ---
-MATCH_THRESH_DIST = 10.0   # center distance in world units
-MATCH_THRESH_AXIS = 0.5    # 50% rel. error in semi-major axis
-MATCH_THRESH_ANGLE = 0.6   # (kept for future use)
-
-# --- DATASET PRIORS (from config.txt, world units) ---
+# Priors (world)
 SEMI_MAJOR_MIN_WORLD = 12.0
 SEMI_MAJOR_MAX_WORLD = 22.0
-
 PMMA_X_MIN = 30.0
 PMMA_X_MAX = 70.0
 PMMA_Y_MIN = 30.0
 PMMA_Y_MAX = 70.0
 
+# Candidate generation
+MAX_CONTOURS = 12
+TOP_RHT_BINS = 25
+TOP_RHT_CANDS = 10
 
-# ---------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------
+RHT_EPOCHS = 6000
+RHT_EPOCHS_HARD = 18000
+ACCUMULATOR_BIN_SIZE = 2
+MIN_VOTES = 2
+
+# Inlier/support
+INLIER_THRESHOLD = 2.5
+MIN_INLIERS_BASE = 8
+
+# Refinement
+REFINE_ITERS = 2
+
+# Training (auto-tune weights)
+DO_AUTOTUNE = True
+TRAIN_SPLIT = 0.8
+RANDOM_SEED = 7
+WEIGHT_TRIALS = 2500  # increase for better tuning if runtime allows
+
+
+# -------------------------
+# Utils
+# -------------------------
 def get_scale_factor(img_width: int) -> float:
     return img_width / WORLD_SPACE_SIZE
 
 
-def convert_to_world(pixel_ellipse, scale: float):
-    """
-    Convert cv2.fitEllipse result (pixel coords) to world coords.
-    pixel_ellipse: ((cx, cy), (d1, d2), angle_deg)
-    """
-    (cx, cy), (d1, d2), angle_deg = pixel_ellipse
+def normalize_ellipse(cand):
+    (cx, cy), (d1, d2), angle = cand
+    if d1 < d2:
+        d1, d2 = d2, d1
+        angle = (angle + 90) % 180
+    return (float(cx), float(cy), float(d1), float(d2), float(angle))
 
+
+def convert_to_world_params(cx, cy, d1, d2, angle_deg, scale):
     wx = cx / scale
     wy = cy / scale
-
-    semi_axis_a = (d1 / 2.0) / scale
-    semi_axis_b = (d2 / 2.0) / scale
-
-    return {
-        "center_x": wx,
-        "center_y": wy,
-        "semi_major_axis": max(semi_axis_a, semi_axis_b),
-        "semi_minor_axis": min(semi_axis_a, semi_axis_b),
-        "orientation_angle_rad": angle_deg * (math.pi / 180.0),
-    }
+    a = (d1 / 2.0) / scale
+    b = (d2 / 2.0) / scale
+    return wx, wy, max(a, b), min(a, b), angle_deg * (math.pi / 180.0)
 
 
-def ellipse_ok_in_world(world_ellipse) -> bool:
-    """
-    Enforce dataset priors on location and semi-major axis.
-    """
-    cx = world_ellipse["center_x"]
-    cy = world_ellipse["center_y"]
-    a = world_ellipse["semi_major_axis"]
+def match_det_to_gt(det_world, gt_list):
+    dx, dy, da = det_world  # center_x, center_y, semi_major_axis
+    for gt in gt_list:
+        dist = math.hypot(dx - gt["center_x"], dy - gt["center_y"])
+        if dist > MATCH_THRESH_DIST:
+            continue
+        g_a = gt.get("semi_major_axis", 0.0)
+        if g_a <= 0:
+            continue
+        rel = abs(da - g_a) / g_a
+        if rel > MATCH_THRESH_AXIS:
+            continue
+        return True
+    return False
 
-    if not (PMMA_X_MIN <= cx <= PMMA_X_MAX):
-        return False
-    if not (PMMA_Y_MIN <= cy <= PMMA_Y_MAX):
-        return False
-    if not (SEMI_MAJOR_MIN_WORLD <= a <= SEMI_MAJOR_MAX_WORLD):
-        return False
-    return True
+
+def count_inliers(points, cx, cy, d1, d2, ang_deg):
+    ang = ang_deg * math.pi / 180.0
+    cos_a, sin_a = math.cos(ang), math.sin(ang)
+    a, b = d1 / 2.0, d2 / 2.0
+    if a < 0.1 or b < 0.1:
+        return 0
+    tol = INLIER_THRESHOLD / min(a, b)
+
+    c = 0
+    for (px, py) in points:
+        tx, ty = px - cx, py - cy
+        xr = tx * cos_a + ty * sin_a
+        yr = -tx * sin_a + ty * cos_a
+        val = (xr / a) ** 2 + (yr / b) ** 2
+        if abs(val - 1.0) < tol:
+            c += 1
+    return c
 
 
-def extract_edge_points(img, intensity_thresh: int = 40, blur_ksize: int = 3):
-    """
-    Extract edge points suitable for ellipse fitting.
+def inlier_indices(points, cx, cy, d1, d2, ang_deg):
+    ang = ang_deg * math.pi / 180.0
+    cos_a, sin_a = math.cos(ang), math.sin(ang)
+    a, b = d1 / 2.0, d2 / 2.0
+    if a < 0.1 or b < 0.1:
+        return []
+    tol = INLIER_THRESHOLD / min(a, b)
 
-    1) Convert to grayscale
-    2) Optional blur to reduce noise
-    3) Remove very dark background with threshold
-    4) Run Canny, return list of (x, y) pixels
-    """
+    idxs = []
+    for i, (px, py) in enumerate(points):
+        tx, ty = px - cx, py - cy
+        xr = tx * cos_a + ty * sin_a
+        yr = -tx * sin_a + ty * cos_a
+        val = (xr / a) ** 2 + (yr / b) ** 2
+        if abs(val - 1.0) < tol:
+            idxs.append(i)
+    return idxs
+
+
+def refine_with_inliers(points, params):
+    cx, cy, d1, d2, ang = params
+    for _ in range(REFINE_ITERS):
+        idxs = inlier_indices(points, cx, cy, d1, d2, ang)
+        if len(idxs) < 25:
+            break
+        pts = np.array([points[i] for i in idxs], dtype=np.int32).reshape(-1, 1, 2)
+        try:
+            if hasattr(cv2, "fitEllipseAMS"):
+                e2 = cv2.fitEllipseAMS(pts)
+            else:
+                e2 = cv2.fitEllipse(pts)
+            cx2, cy2, d1_2, d2_2, ang2 = normalize_ellipse(e2)
+
+            sup_old = count_inliers(points, cx, cy, d1, d2, ang)
+            sup_new = count_inliers(points, cx2, cy2, d1_2, d2_2, ang2)
+
+            if sup_new >= sup_old:
+                cx, cy, d1, d2, ang = cx2, cy2, d1_2, d2_2, ang2
+            else:
+                break
+        except Exception:
+            break
+    return (cx, cy, d1, d2, ang)
+
+
+# -------------------------
+# Preprocess variants
+# -------------------------
+def preprocess_variants(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    if blur_ksize > 0:
-        gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    g = clahe.apply(gray)
 
-    # Remove very dark background
-    _, mask = cv2.threshold(gray, intensity_thresh, 255, cv2.THRESH_TOZERO)
+    out = []
 
+    # Otsu normal
+    _, th1 = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(th1)
+
+    # Otsu inverted
+    out.append(255 - th1)
+
+    # Adaptive mean
+    th2 = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY, 31, 2)
+    out.append(th2)
+    out.append(255 - th2)
+
+    # Adaptive gaussian
+    th3 = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 31, 2)
+    out.append(th3)
+    out.append(255 - th3)
+
+    cleaned = []
+    kernel = np.ones((3, 3), np.uint8)
+    for th in out:
+        t = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+        t = cv2.morphologyEx(t, cv2.MORPH_CLOSE, kernel, iterations=2)
+        cleaned.append(t)
+
+    return cleaned
+
+
+def edge_points_from_mask(mask):
     edges = cv2.Canny(mask, 50, 150)
-
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
     ys, xs = np.where(edges > 0)
-    points = list(zip(xs.tolist(), ys.tolist()))
-    return points
+    return list(zip(xs.tolist(), ys.tolist()))
 
 
-# ---------------------------------------------------------
-# Randomized Hough Transform for ellipses
-# ---------------------------------------------------------
-def rht_single_pass(points, width, height):
-    """
-    One RHT pass: sample 5 points many times, fit ellipses with cv2.fitEllipse,
-    accumulate in quantized parameter space, return the best ellipse + inliers.
-    """
-    if len(points) < 5:
-        return None, []
+# -------------------------
+# Candidate generation
+# -------------------------
+def contour_candidates(img):
+    cands = []
+    for mask in preprocess_variants(img):
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cnts:
+            continue
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:MAX_CONTOURS]
+        for c in cnts:
+            if len(c) < 30:
+                continue
+            try:
+                if hasattr(cv2, "fitEllipseAMS"):
+                    e = cv2.fitEllipseAMS(c)
+                else:
+                    e = cv2.fitEllipse(c)
+                cx, cy, d1, d2, ang = normalize_ellipse(e)
+                area = float(cv2.contourArea(c))
+                cands.append((cx, cy, d1, d2, ang, area, "contour"))
+            except Exception:
+                continue
+    return cands
 
+
+def rht_candidates(points, width, height):
+    if len(points) < 30:
+        return []
+
+    epochs = RHT_EPOCHS if len(points) >= 180 else RHT_EPOCHS_HARD
     accumulator = defaultdict(int)
     bin_to_params = defaultdict(list)
 
-    for _ in range(RHT_EPOCHS):
+    for _ in range(epochs):
         sample = random.sample(points, 5)
-
         try:
-            cand = cv2.fitEllipse(np.array(sample, dtype=np.int32))
-            (cx, cy), (d1, d2), angle = cand
+            e = cv2.fitEllipse(np.array(sample, dtype=np.int32))
+            cx, cy, d1, d2, ang = normalize_ellipse(e)
 
-            if (
-                np.isnan(cx)
-                or np.isnan(cy)
-                or np.isnan(d1)
-                or np.isnan(d2)
-            ):
-                continue
-
-            # Filter weird shapes (centers too far, or degenerate sizes)
-            if not (-width < cx < 2 * width) or not (-height < cy < 2 * height):
-                continue
-            if d1 < 2 or d2 < 2:
-                continue
-
-            # Normalize so that d1 is semi-major axis
-            if d1 < d2:
-                d1, d2 = d2, d1
-                angle = (angle + 90) % 180
-
-            # Quantize parameters into bins
             key = (
                 int(cx / ACCUMULATOR_BIN_SIZE),
                 int(cy / ACCUMULATOR_BIN_SIZE),
                 int(d1 / ACCUMULATOR_BIN_SIZE),
                 int(d2 / ACCUMULATOR_BIN_SIZE),
-                int(angle / 10),  # 10° bins
+                int(ang / 10),
             )
-
             accumulator[key] += 1
-            bin_to_params[key].append(((cx, cy), (d1, d2), angle))
-
+            bin_to_params[key].append((cx, cy, d1, d2, ang))
         except Exception:
             continue
 
     if not accumulator:
-        return None, []
+        return []
 
-    best_key = max(accumulator, key=accumulator.get)
+    sorted_bins = sorted(accumulator.items(), key=lambda kv: kv[1], reverse=True)[:TOP_RHT_BINS]
 
-    # Not enough support for any ellipse
-    if accumulator[best_key] < MIN_VOTES:
-        return None, []
+    cands = []
+    for key, votes in sorted_bins:
+        if votes < MIN_VOTES:
+            continue
+        params = bin_to_params[key]
+        cx = float(np.mean([p[0] for p in params]))
+        cy = float(np.mean([p[1] for p in params]))
+        d1 = float(np.mean([p[2] for p in params]))
+        d2 = float(np.mean([p[3] for p in params]))
+        ang = float(np.mean([p[4] for p in params]))
+        cands.append((cx, cy, d1, d2, ang, float(votes), "rht"))
 
-    cands = bin_to_params[best_key]
-
-    # Average parameters of best bin
-    avg_cx = np.mean([c[0][0] for c in cands])
-    avg_cy = np.mean([c[0][1] for c in cands])
-    avg_d1 = np.mean([c[1][0] for c in cands])
-    avg_d2 = np.mean([c[1][1] for c in cands])
-    avg_ang = np.mean([c[2] for c in cands])
-
-    final_ellipse = ((avg_cx, avg_cy), (avg_d1, avg_d2), avg_ang)
-
-    # --- Inlier selection ---
-    inlier_indices = []
-    ang_rad = avg_ang * math.pi / 180.0
-    cos_a, sin_a = math.cos(ang_rad), math.sin(ang_rad)
-    a, b = avg_d1 / 2.0, avg_d2 / 2.0
-
-    if a < 0.1 or b < 0.1:
-        return None, []
-
-    for idx, (px, py) in enumerate(points):
-        tx, ty = px - avg_cx, py - avg_cy
-        xr = tx * cos_a + ty * sin_a
-        yr = -tx * sin_a + ty * cos_a
-        dist = (xr / a) ** 2 + (yr / b) ** 2
-
-        if abs(dist - 1.0) < (INLIER_THRESHOLD / min(a, b)):
-            inlier_indices.append(idx)
-
-    return final_ellipse, inlier_indices
+    cands.sort(key=lambda x: x[5], reverse=True)
+    return cands[:TOP_RHT_CANDS]
 
 
-# ---------------------------------------------------------
-# Per-image processing
-# ---------------------------------------------------------
-def process_image(img_path, gt_ellipses):
-    img = cv2.imread(img_path)
-    if img is None:
-        return 0, 0, len(gt_ellipses)
+# -------------------------
+# Features + scoring
+# -------------------------
+def compute_features(cx, cy, d1, d2, ang, aux, method, points, scale):
+    a_px = d1 / 2.0
+    b_px = d2 / 2.0
+    ratio = a_px / (b_px + 1e-6)
+    if ratio < 1.0:
+        ratio = 1.0 / ratio
 
+    ratio_pen = 0.0
+    if ratio < 1.05:
+        ratio_pen = (1.05 - ratio)
+    elif ratio > 2.8:
+        ratio_pen = (ratio - 2.8)
+
+    exp_cx = 50.0 * scale
+    exp_cy = 50.0 * scale
+    center_dist = math.hypot(cx - exp_cx, cy - exp_cy)
+
+    wx, wy, wa, wb, _ = convert_to_world_params(cx, cy, d1, d2, ang, scale)
+
+    prior_pen = 0.0
+    if wx < PMMA_X_MIN:
+        prior_pen += (PMMA_X_MIN - wx)
+    elif wx > PMMA_X_MAX:
+        prior_pen += (wx - PMMA_X_MAX)
+    if wy < PMMA_Y_MIN:
+        prior_pen += (PMMA_Y_MIN - wy)
+    elif wy > PMMA_Y_MAX:
+        prior_pen += (wy - PMMA_Y_MAX)
+    if wa < SEMI_MAJOR_MIN_WORLD:
+        prior_pen += (SEMI_MAJOR_MIN_WORLD - wa) * 2.0
+    elif wa > SEMI_MAJOR_MAX_WORLD:
+        prior_pen += (wa - SEMI_MAJOR_MAX_WORLD) * 2.0
+
+    support = count_inliers(points, cx, cy, d1, d2, ang)
+
+    # aux: contour area or votes
+    if method == "contour":
+        area = float(aux)
+        votes = 0.0
+    else:
+        area = 0.0
+        votes = float(aux)
+
+    # Feature vector (all positive)
+    # We maximize: +support +a_px +area +votes  minus penalties
+    feats = np.array([
+        float(support),
+        float(a_px),
+        float(area),
+        float(votes),
+        float(center_dist),
+        float(ratio_pen),
+        float(prior_pen),
+        1.0
+    ], dtype=np.float32)
+
+    return feats, support, (wx, wy, wa)
+
+
+def pick_primary(candidates, points, scale, weights):
+    best = None
+    best_score = -1e18
+
+    min_inliers = max(MIN_INLIERS_BASE, int(0.03 * len(points))) if len(points) > 0 else MIN_INLIERS_BASE
+
+    for (cx, cy, d1, d2, ang, aux, method) in candidates:
+        feats, support, _ = compute_features(cx, cy, d1, d2, ang, aux, method, points, scale)
+        if support < min_inliers:
+            continue
+        score = float(np.dot(weights, feats))
+        if score > best_score:
+            best_score = score
+            best = (cx, cy, d1, d2, ang, method)
+
+    if best is None:
+        return None
+
+    cx, cy, d1, d2, ang, method = best
+    refined = refine_with_inliers(points, (cx, cy, d1, d2, ang))
+    cx, cy, d1, d2, ang = refined
+    return ((cx, cy), (d1, d2), ang)
+
+
+# -------------------------
+# Pipeline per image
+# -------------------------
+def detect_primary(img):
     h, w = img.shape[:2]
     scale = get_scale_factor(w)
 
-    # 1. Extract edge points for RHT
-    all_points = extract_edge_points(img, intensity_thresh=40)
+    # Collect candidates (do NOT hard-reject here)
+    cands = []
+    cands.extend(contour_candidates(img))
 
-    detected_ellipses = []
-    current_points = all_points[:]
+    # Edge points for scoring + RHT fallback
+    # Use union of edges from multiple masks to increase coverage
+    points = []
+    for mask in preprocess_variants(img):
+        points.extend(edge_points_from_mask(mask))
+    if len(points) > 6000:
+        points = random.sample(points, 6000)
 
-    # 2. Randomized Hough Transform (multiple passes)
-    rht_success = False
-    for _ in range(3):
-        if len(current_points) < 5:
-            break
+    # Add RHT candidates
+    if len(points) >= 30:
+        cands.extend(rht_candidates(points, w, h))
 
-        ellipse, inliers = rht_single_pass(current_points, w, h)
-        if ellipse is None:
-            break
-
-        world_ellipse = convert_to_world(ellipse, scale)
-
-        # apply dataset priors
-        if not ellipse_ok_in_world(world_ellipse):
-            # still remove these inliers (they belong to some structure)
-            inlier_set = set(inliers)
-            current_points = [
-                p for i, p in enumerate(current_points) if i not in inlier_set
-            ]
-            continue
-
-        rht_success = True
-        detected_ellipses.append(world_ellipse)
-
-        # Remove inliers from current_points to allow another ellipse
-        inlier_set = set(inliers)
-        current_points = [
-            p for i, p in enumerate(current_points) if i not in inlier_set
-        ]
-
-    # 3. Fallback: standard fit on all edge points if RHT found nothing
-    if (not rht_success) and len(all_points) >= 5:
-        try:
-            pts = np.array([[x, y] for (x, y) in all_points], dtype=np.int32)
-            fallback = cv2.fitEllipse(pts)
-            world_fb = convert_to_world(fallback, scale)
-            if ellipse_ok_in_world(world_fb):
-                detected_ellipses.append(world_fb)
-        except Exception:
-            pass
-
-    # 4. Match detections to GT
-    tp = 0
-    fp = 0
-    matched_gt = set()
-
-    for det in detected_ellipses:
-        match_found = False
-        for idx, gt in enumerate(gt_ellipses):
-            if idx in matched_gt:
-                continue
-
-            # center distance in world units
-            dist = math.hypot(
-                det["center_x"] - gt["center_x"],
-                det["center_y"] - gt["center_y"],
-            )
-            if dist > MATCH_THRESH_DIST:
-                continue
-
-            if gt["semi_major_axis"] == 0:
-                continue
-
-            diff_a = abs(det["semi_major_axis"] - gt["semi_major_axis"]) / gt[
-                "semi_major_axis"
-            ]
-            if diff_a > MATCH_THRESH_AXIS:
-                continue
-
-            # (Optional) add checks for semi_minor_axis and orientation if needed
-
-            tp += 1
-            matched_gt.add(idx)
-            match_found = True
-            break
-
-        if not match_found:
-            fp += 1
-
-    fn = len(gt_ellipses) - len(matched_gt)
-    return tp, fp, fn
+    return cands, points, scale
 
 
-# ---------------------------------------------------------
-# Main
-# ---------------------------------------------------------
-def main():
-    print(f"--- STARTING OPTIMIZED BATCH RHT ---")
-    print(
-        f"Bins: {ACCUMULATOR_BIN_SIZE} | Epochs: {RHT_EPOCHS} | Min Votes: {MIN_VOTES}"
-    )
-
-    try:
-        with open(ANNOTATIONS_FILE, "r") as f:
-            data = json.load(f)
-    except Exception:
-        print("JSON not found.")
-        return
-
-    global_tp = 0
-    global_fp = 0
-    global_fn = 0
+def evaluate_dataset(image_ids, paths_by_id, gt_by_id, weights):
+    tp = fp = fn = 0
+    correct_images = 0
     processed = 0
 
-    # group annotations by image id, keep only 'primary'
-    anns_by_id = {}
-    for ann in data["annotations"]:
-        anns_by_id[ann["image_id"]] = [
-            e for e in ann["ellipses"] if e.get("type") == "primary"
-        ]
-
-    for entry in data["images"]:
-        img_id = entry["id"]
-        path = os.path.join(IMAGE_FOLDER, f"id_{img_id}.png")
-        if not os.path.exists(path):
-            path = os.path.join(IMAGE_FOLDER, f"image_{img_id}.png")
-        if not os.path.exists(path):
+    for img_id in image_ids:
+        path = paths_by_id.get(img_id)
+        if path is None or not os.path.exists(path):
             continue
 
-        gt = anns_by_id.get(img_id, [])
-        tp, fp, fn = process_image(path, gt)
+        img = cv2.imread(path)
+        if img is None:
+            continue
 
-        global_tp += tp
-        global_fp += fp
-        global_fn += fn
         processed += 1
+        gt = gt_by_id.get(img_id, [])
 
-        if processed % 50 == 0:
-            print(f"Processed {processed} images... (TP: {global_tp}, FN: {global_fn})")
+        candidates, points, scale = detect_primary(img)
+        det = pick_primary(candidates, points, scale, weights)
 
-    if processed == 0:
+        det_list = []
+        if det is not None:
+            cx, cy = det[0]
+            d1, d2 = det[1]
+            ang = det[2]
+            wx, wy, wa, _, _ = convert_to_world_params(cx, cy, d1, d2, ang, scale)
+            det_list.append((wx, wy, wa))
+
+        matched = False
+        if len(det_list) > 0 and len(gt) > 0:
+            matched = match_det_to_gt(det_list[0], gt)
+
+        if matched:
+            tp += 1
+            correct_images += 1
+        else:
+            # If we produced a detection but it didn't match => FP
+            if len(det_list) > 0:
+                fp += 1
+            # If GT exists and we missed => FN
+            if len(gt) > 0:
+                fn += 1
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    accuracy = correct_images / processed if processed > 0 else 0.0
+
+    return {
+        "processed": processed,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1
+    }
+
+
+def autotune_weights(train_ids, paths_by_id, gt_by_id):
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    # weights correspond to:
+    # [support, a_px, area, votes, center_dist, ratio_pen, prior_pen, bias]
+    # score = +support +a +area +votes -center -ratio_pen -prior_pen +bias
+    # We'll sample weights with correct sign tendencies but allow variation.
+    best_w = None
+    best_acc = -1.0
+
+    def sample_w():
+        w = np.zeros(8, dtype=np.float32)
+        w[0] = np.random.uniform(0.7, 1.6)     # support +
+        w[1] = np.random.uniform(0.0, 0.20)    # size +
+        w[2] = np.random.uniform(0.0, 0.0008)  # contour area + (small scale)
+        w[3] = np.random.uniform(0.0, 1.0)     # votes +
+        w[4] = -np.random.uniform(0.005, 0.08) # center -
+        w[5] = -np.random.uniform(2.0, 25.0)   # ratio penalty -
+        w[6] = -np.random.uniform(0.2, 6.0)    # prior penalty -
+        w[7] = np.random.uniform(-5.0, 5.0)    # bias
+        return w
+
+    # Start with a sane default
+    default_w = np.array([1.2, 0.08, 0.00025, 0.4, -0.03, -10.0, -1.5, 0.0], dtype=np.float32)
+    best_w = default_w
+    best_acc = evaluate_dataset(train_ids, paths_by_id, gt_by_id, best_w)["accuracy"]
+
+    for t in range(WEIGHT_TRIALS):
+        w = sample_w()
+        res = evaluate_dataset(train_ids, paths_by_id, gt_by_id, w)
+        acc = res["accuracy"]
+        if acc > best_acc:
+            best_acc = acc
+            best_w = w
+
+    return best_w, best_acc
+
+
+def main():
+    with open(ANNOTATIONS_FILE, "r") as f:
+        data = json.load(f)
+
+    gt_by_id = {}
+    for ann in data["annotations"]:
+        gt_by_id[ann["image_id"]] = [e for e in ann["ellipses"] if e.get("type") == "primary"]
+
+    paths_by_id = {}
+    image_ids = []
+    for entry in data["images"]:
+        img_id = entry["id"]
+        p1 = os.path.join(IMAGE_FOLDER, f"id_{img_id}.png")
+        p2 = os.path.join(IMAGE_FOLDER, f"image_{img_id}.png")
+        path = p1 if os.path.exists(p1) else (p2 if os.path.exists(p2) else None)
+        if path is None:
+            continue
+        paths_by_id[img_id] = path
+        image_ids.append(img_id)
+
+    if not image_ids:
+        print("No images found.")
         return
 
-    precision = (
-        global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else 0.0
-    )
-    recall = global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else 0.0
-    f1 = (
-        2 * (precision * recall) / (precision + recall)
-        if (precision + recall) > 0
-        else 0.0
-    )
+    random.seed(RANDOM_SEED)
+    random.shuffle(image_ids)
+    split = int(TRAIN_SPLIT * len(image_ids))
+    train_ids = image_ids[:split]
+    val_ids = image_ids[split:]
 
-    print("\n" + "=" * 30)
-    print("FINAL OPTIMIZED RESULTS")
-    print("=" * 30)
-    print(f"Images:    {processed}")
-    print(f"Precision: {precision:.2%}")
-    print(f"Recall:    {recall:.2%}")
-    print(f"F1 Score:  {f1:.2%}")
-    print("=" * 30)
+    if DO_AUTOTUNE:
+        best_w, train_acc = autotune_weights(train_ids, paths_by_id, gt_by_id)
+    else:
+        best_w = np.array([1.2, 0.08, 0.00025, 0.4, -0.03, -10.0, -1.5, 0.0], dtype=np.float32)
+        train_acc = evaluate_dataset(train_ids, paths_by_id, gt_by_id, best_w)["accuracy"]
+
+    train_res = evaluate_dataset(train_ids, paths_by_id, gt_by_id, best_w)
+    val_res = evaluate_dataset(val_ids, paths_by_id, gt_by_id, best_w)
+
+    print("\n" + "=" * 34)
+    print("TRAIN RESULTS")
+    print("=" * 34)
+    print(f"Images:    {train_res['processed']}")
+    print(f"Accuracy:  {train_res['accuracy']:.2%}")
+    print(f"Precision: {train_res['precision']:.2%}")
+    print(f"Recall:    {train_res['recall']:.2%}")
+    print(f"F1 Score:  {train_res['f1']:.2%}")
+    print(f"Weights:   {best_w.tolist()}")
+
+    print("\n" + "=" * 34)
+    print("VALIDATION RESULTS")
+    print("=" * 34)
+    print(f"Images:    {val_res['processed']}")
+    print(f"Accuracy:  {val_res['accuracy']:.2%}")
+    print(f"Precision: {val_res['precision']:.2%}")
+    print(f"Recall:    {val_res['recall']:.2%}")
+    print(f"F1 Score:  {val_res['f1']:.2%}")
+    print("=" * 34)
 
 
 if __name__ == "__main__":
